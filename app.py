@@ -1,55 +1,163 @@
 import gradio as gr
-from src.model_loader import load_model
-from src.router import handle_message
-from src.analytics import Analytics
-from src.config import AppConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
-# Load model and tokenizer
-tokenizer, model = load_model()
+MODEL_NAME = "microsoft/DialoGPT-medium"
 
-# Initialize analytics tracker
-analytics = Analytics()
+print("===== Application Startup =====")
+print("Loading model and tokenizer...")
 
-def chat_interface(user_message, history, persona, topic, level):
-    response, history_updated = handle_message(
-        user_message=user_message,
-        history=history,
-        persona=persona,
-        topic=topic,
-        level=level,
-        tokenizer=tokenizer,
-        model=model,
-        analytics=analytics
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+print("Device:", device)
+print("Model loaded.")
+
+# ---------------------------------------------------------
+# LIGHT SAFETY FILTER 
+# ---------------------------------------------------------
+
+BLOCK_KEYWORDS = [
+    "nsfw", "sex", "porn", "murder", "kill", "suicide", "self-harm"
+]
+
+def is_strongly_unsafe(text: str) -> bool:
+    """Very small filter — only block MAJOR issues."""
+    txt = text.lower()
+    return any(word in txt for word in BLOCK_KEYWORDS)
+
+
+# ---------------------------------------------------------
+# NORMAL CHATBOT BEHAVIOR (DialoGPT-Style)
+# ---------------------------------------------------------
+
+def build_prompt(messages, new_user_text):
+    """
+    Only light steering.
+    Pure conversation history:
+    User: ...
+    Bot: ...
+    """
+    prompt = ""
+
+    # last 6 turns
+    history = messages[-6:] if messages else []
+
+    for m in history:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "user":
+            prompt += f"User: {content}\n"
+        else:
+            prompt += f"Bot: {content}\n"
+
+    # new message
+    prompt += f"User: {new_user_text}\nBot:"
+
+    return prompt
+
+
+def generate_reply(messages, user_input):
+    # Hard block only severe unsafe inputs
+    if is_strongly_unsafe(user_input):
+        return (
+            "I’m here to keep our chat positive and safe 😊 "
+            "Let’s talk about hobbies, movies, food, travel, or anything fun!"
+        )
+
+    prompt = build_prompt(messages, user_input)
+
+    enc = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    ).to(device)
+
+    output_ids = model.generate(
+        **enc,
+        max_new_tokens=60,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=True,       # IMPORTANT — DialoGPT needs sampling
+        top_p=0.95,
+        top_k=50,
+        temperature=0.8       # makes responses fun & stable
     )
-    return history_updated
 
-# ------------------------
-# UI components
-# ------------------------
-personas = ["Stats Tutor", "Python & Pandas Helper", "ML Concepts Coach", "Project Mentor"]
-topics = ["Statistics", "Python/Pandas", "Machine Learning", "Data Science Projects"]
-levels = ["Beginner", "Intermediate"]
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-with gr.Blocks(title="DataSensei – Data Science Learning Assistant 🤖📊") as demo:
-    
-    gr.Markdown("# **DataSensei – Data Science Learning Assistant 🤖📊**")
-    gr.Markdown("Ask me anything about Python, Pandas, Stats, or Machine Learning!")
+    # Extract only bot's last turn
+    if "Bot:" in decoded:
+        reply = decoded.split("Bot:")[-1].strip()
+    else:
+        reply = decoded.strip()
 
-    with gr.Row():
-        persona_dd = gr.Dropdown(label="Persona", choices=personas, value="Python & Pandas Helper")
-        topic_dd = gr.Dropdown(label="Topic", choices=topics, value="Python/Pandas")
-        level_dd = gr.Dropdown(label="Level", choices=levels, value="Beginner")
+    # Remove weird DialoGPT glitches
+    if len(reply) < 1:
+        reply = "Haha! That's interesting 😄"
+    if len(reply) > 200:
+        reply = reply[:200]
 
-    chatbot = gr.Chatbot(height=450)
+    # Soft safety check on model output
+    if is_strongly_unsafe(reply):
+        reply = (
+            "Let’s keep things friendly and chill 😄 "
+            "Tell me something fun or ask anything casual!"
+        )
 
-    with gr.Row():
-        msg_box = gr.Textbox(label="Ask a question")
-        clear_btn = gr.Button("Clear Chat")
+    return reply
 
-    def start_chat(msg, history):
-        return "", history
 
-    msg_box.submit(chat_interface, [msg_box, chatbot, persona_dd, topic_dd, level_dd], chatbot)
-    clear_btn.click(lambda: None, None, chatbot, queue=False)
+# ---------------------------------------------------------
+# GRADIO CHATBOT
+# ---------------------------------------------------------
 
-demo.launch()
+WELCOME_MESSAGE = {
+    "role": "assistant",
+    "content": "Hey! I'm MiniBot 🤖. Let's chat! Tell me anything casual 😄"
+}
+
+def respond(user_message, messages):
+    if messages is None or len(messages) == 0:
+        messages = [WELCOME_MESSAGE]
+
+    user_message = user_message.strip()
+
+    # Add user message
+    messages = messages + [{"role": "user", "content": user_message}]
+
+    # Generate reply
+    reply = generate_reply(messages, user_message)
+
+    # Add bot reply
+    messages = messages + [{"role": "assistant", "content": reply}]
+
+    return messages, ""
+
+
+def clear_chat():
+    return [WELCOME_MESSAGE], ""
+
+
+# ---------------------------------------------------------
+# UI
+# ---------------------------------------------------------
+
+with gr.Blocks(title="MiniBot – Chill Chatbot") as demo:
+    gr.Markdown("## 🤖 MiniBot – Friendly Chill Chatbot")
+    gr.Markdown(
+        "MiniBot is here to chat casually! 😊\n"
+        "Talk about movies, hobbies, travel, food, music — anything fun and safe!"
+    )
+
+    chatbot = gr.Chatbot(value=[WELCOME_MESSAGE])
+    msg = gr.Textbox(placeholder="Say something fun! 😊")
+    clear = gr.Button("🧹 Clear Chat")
+
+    msg.submit(respond, [msg, chatbot], [chatbot, msg])
+    clear.click(clear_chat, None, [chatbot, msg], queue=False)
+
+if __name__ == "__main__":
+    demo.launch()
